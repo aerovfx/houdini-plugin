@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<shelf name="pixibox" label="Pixibox">
+  <toolshelf name="pixibox_tools" label="Pixibox">
+
+    <!-- Generate from Prompt -->
+    <tool name="pixibox_prompt" label="Generate from Prompt" icon="$PIXIBOX_HOUDINI/icons/prompt.png">
+      <helpText><![CDATA[
+Open dialog to generate 3D model from text prompt.
+
+Click to open the text-to-3D generation dialog.
+Enter a detailed description of the model you want to generate.
+      ]]></helpText>
+      <script><![CDATA[
+from pixibox_houdini.shelf_tools import generate_from_prompt
+generate_from_prompt()
+      ]]></script>
+    </tool>
+
+    <!-- Generate from Image -->
+    <tool name="pixibox_image" label="Generate from Image" icon="$PIXIBOX_HOUDINI/icons/image.png">
+      <helpText><![CDATA[
+Open dialog to generate 3D model from image.
+
+Click to select an image file, then choose the AI model.
+The platform will generate a 3D model based on the image content.
+      ]]></helpText>
+      <script><![CDATA[
+from pixibox_houdini.shelf_tools import generate_from_image
+generate_from_image()
+      ]]></script>
+    </tool>
+
+    <!-- Import Latest Generation -->
+    <tool name="pixibox_import_latest" label="Import Latest" icon="$PIXIBOX_HOUDINI/icons/import.png">
+      <helpText><![CDATA[
+Import the most recently completed generation to USD stage.
+
+Automatically imports the latest generation with default settings
+(MaterialX conversion, texture resolution from settings).
+      ]]></helpText>
+      <script><![CDATA[
+from pixibox_houdini.shelf_tools import import_latest
+import_latest()
+      ]]></script>
+    </tool>
+
+    <!-- Toggle Bridge -->
+    <tool name="pixibox_bridge" label="Toggle Bridge" icon="$PIXIBOX_HOUDINI/icons/bridge.png">
+      <helpText><![CDATA[
+Toggle Pixibox Bridge real-time update panel.
+
+Shows live progress updates for generation tasks.
+Connect/disconnect from the WebSocket bridge for monitoring.
+      ]]></helpText>
+      <script><![CDATA[
+from pixibox_houdini.shelf_tools import toggle_bridge
+toggle_bridge()
+      ]]></script>
+    </tool>
+
+    <!-- Open Settings -->
+    <tool name="pixibox_settings" label="Settings" icon="$PIXIBOX_HOUDINI/icons/settings.png">
+      <helpText><![CDATA[
+Open Pixibox settings dialog.
+
+Configure API endpoint, authentication token, default AI model,
+material options, and texture resolution.
+      ]]></helpText>
+      <script><![CDATA[
+from pixibox_houdini.shelf_tools import open_settings
+open_settings()
+      ]]></script>
+    </tool>
+
+    <!-- Separator -->
+    <separator/>
+
+    <!-- History Browser -->
+    <tool name="pixibox_history" label="History" icon="$PIXIBOX_HOUDINI/icons/history.png">
+      <helpText><![CDATA[
+Browse past generations and import them.
+
+Shows a list of all previous generations with status,
+model info, and quick import buttons.
+      ]]></helpText>
+      <script><![CDATA[
+# Open history browser dialog
+from pixibox_houdini.api import list_generations
+import hou
+
+try:
+    generations = list_generations(limit=20)
+
+    if not generations:
+        hou.ui.displayMessage("No generations found")
+    else:
+        # Create simple dialog showing generations
+        gen_list = "\n".join([
+            f"{g['id'][:8]}... - {g['status']} ({g.get('model', 'unknown')})"
+            for g in generations
+        ])
+        hou.ui.displayMessage(f"Recent Generations:\n\n{gen_list}")
+
+except Exception as e:
+    hou.ui.displayMessage(f"Error: {str(e)}", severity=hou.severityType.Error)
+      ]]></script>
+    </tool>
+
+    <!-- Quick Help -->
+    <tool name="pixibox_help" label="Help" icon="$PIXIBOX_HOUDINI/icons/help.png">
+      <helpText><![CDATA[
+Open Pixibox plugin documentation.
+
+Shows quick start guide and troubleshooting info.
+      ]]></helpText>
+      <script><![CDATA[
+# Display quick help
+import hou
+
+help_text = """
+PIXIBOX HOUDINI PLUGIN — Quick Start
+
+1. GENERATE FROM PROMPT
+   - Click "Generate from Prompt" on this shelf
+   - Enter a description of the 3D model
+   - Select AI provider and click "Generate"
+   - Watch progress in Bridge panel
+
+2. GENERATE FROM IMAGE
+   - Click "Generate from Image"
+   - Select an image file
+   - Monitor generation in Bridge panel
+
+3. IMPORT TO STAGE
+   - Generation auto-imports when complete (if enabled)
+   - Or click "Import Latest" to manually import
+   - Model appears in /World/Imports/Model prim path
+
+4. CONFIGURE SETTINGS
+   - Click "Settings" to configure API endpoint
+   - Set authentication token
+   - Choose default AI model
+   - Enable/disable MaterialX materials
+
+TROUBLESHOOTING:
+- Not in Solaris? Switch to the "Solaris" tab in viewport
+- API errors? Check API token in Settings
+- Import fails? Ensure you have Solaris license
+
+For full documentation, see: docs.pixibox.ai/houdini
+"""
+
+hou.ui.displayMessage(help_text)
+      ]]></script>
+    </tool>
+
+  </toolshelf>
+</shelf>

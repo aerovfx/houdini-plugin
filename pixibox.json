@@ -1,0 +1,8 @@
+{
+  "env": [
+    {
+      "PIXIBOX_HOUDINI": "$HOUDINI_PACKAGE_PATH/pixibox"
+    }
+  ],
+  "path": "$PIXIBOX_HOUDINI"
+}
