@@ -1,341 +1,228 @@
-"""
-Solaris/LOPs utilities for USD composition and MaterialX conversion.
+"""Pixibox Solaris/LOP integration for Houdini USD workflows."""
 
-Handles importing generated 3D models into USD stage, setting up
-material networks, and managing geometry in LOPs context.
-"""
-
+import hou
 import os
-import json
-from typing import Optional, Dict, Any, Tuple
-
-try:
-    import hou
-    from pxr import Usd, UsdGeom, Sdf, UsdShade, UsdUtils
-    from pxr import MaterialX as Mtlx
-    HAS_HOUDINI = True
-except ImportError:
-    HAS_HOUDINI = False
-    hou = None  # type: ignore
-    Usd = None  # type: ignore
-    UsdGeom = None  # type: ignore
-    Sdf = None  # type: ignore
-    UsdShade = None  # type: ignore
-    UsdUtils = None  # type: ignore
-    Mtlx = None  # type: ignore
+import tempfile
+from typing import Optional, Tuple
+from . import api
 
 
-from .api import PixiboxClient, download_model
+class PixiboxSolarisNode:
+    """Custom LOP node for Pixibox USD integration in Solaris."""
 
+    def __init__(self):
+        """Initialize Solaris node handler."""
+        self.api = None
+        self.lop_node = None
 
-def get_current_stage() -> Optional[Any]:
-    """
-    Get currently active USD stage in Solaris/LOPs.
+    def cook(self, lop_node):
+        """Cook the LOP node with Pixibox scene.
 
-    Returns:
-        pxr.Usd.Stage object or None if not in LOPs context
+        Args:
+            lop_node: The Houdini LOP node being cooked
+        """
+        try:
+            # Check if LOPs available (Houdini FX/Solaris only)
+            if not self._check_lops_available():
+                raise hou.NodeError("Solaris/LOPs not available in this Houdini version")
 
-    Raises:
-        RuntimeError: If Houdini/Solaris not available
-    """
-    if not HAS_HOUDINI:
-        raise RuntimeError("Houdini/USD libraries not available")
+            # Get parameters
+            api_key = lop_node.parm("api_key").eval()
+            scene_id = lop_node.parm("scene_id").eval()
+            import_mode = lop_node.parm("import_mode").eval()  # 0=sublayer, 1=reference
 
-    if not hou:
-        raise RuntimeError("Not running in Houdini context")
+            if not api_key:
+                raise hou.NodeError("API key not set")
 
-    try:
-        # Get active viewer pane in Solaris
-        desktop = hou.ui.curDesktop()
-        for pane in desktop.paneTabs():
-            if pane.type().name() == "SceneViewer":
-                # Check if in LOPs context
-                geo = pane.pwd()
-                if geo and geo.path().startswith("/lops"):
-                    # Get USD stage from LOP node
-                    if hasattr(geo, "stage"):
-                        return geo.stage()
+            if not scene_id:
+                raise hou.NodeError("Scene ID not set")
 
-        # Fallback: try to get from SOLARIS_LOP env variable
-        return None
+            # Initialize API
+            self.api = api.PixiboxAPI(api_key)
+            self.lop_node = lop_node
 
-    except Exception as e:
-        raise RuntimeError(f"Failed to get current stage: {str(e)}")
+            # Fetch USD from Pixibox
+            success, usd_url, msg = self.api.export_usd(scene_id, "usda")
+            if not success:
+                raise hou.NodeError(f"Failed to get USD export: {msg}")
 
+            # Download USD to temp file
+            temp_dir = tempfile.gettempdir()
+            usd_path = os.path.join(temp_dir, f"pixibox_{scene_id}.usda")
 
-def import_to_stage(
-    generation_id: str,
-    prim_path: str = "/World/Imports/Model",
-    apply_materialx: bool = True,
-    auto_optimize: bool = False,
-    texture_resolution: str = "high",
-    token: Optional[str] = None,
-) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Import generated model to USD stage.
+            success, msg = self.api.download_usd(usd_url, usd_path)
+            if not success:
+                raise hou.NodeError(f"Failed to download USD: {msg}")
 
-    Downloads the GLB model and imports it to the specified prim path
-    in the current USD stage, optionally applying MaterialX materials.
+            # Import into Solaris stage
+            import_mode_str = "sublayer" if import_mode == 0 else "reference"
+            self._import_to_solaris(lop_node, usd_path, import_mode_str)
 
-    Args:
-        generation_id: Pixibox generation ID
-        prim_path: Target prim path (e.g. "/World/Imports/Vase")
-        apply_materialx: Convert materials to MaterialX
-        auto_optimize: Apply mesh optimization (remesh, decimate)
-        texture_resolution: "low", "medium", "high" for texture LOD
-        token: Auth token (reads PIXIBOX_AUTH_TOKEN if not set)
-
-    Returns:
-        Tuple of (import_node_path, metadata_dict) or (None, error_dict)
-
-    Example:
-        >>> node_path, meta = import_to_stage(
-        ...     "gen-123",
-        ...     "/World/Imports/MyVase",
-        ...     apply_materialx=True
-        ... )
-        >>> if node_path:
-        ...     print(f"Imported to {node_path}")
-        ... else:
-        ...     print(f"Error: {meta['error']}")
-    """
-    if not HAS_HOUDINI:
-        return None, {"error": "Houdini/USD libraries not available"}
-
-    try:
-        # Download model
-        model_path = download_model(generation_id, format="glb", token=token)
-
-        # Get current LOP node (parent)
-        pwd = hou.pwd()
-        if not pwd or not pwd.path().startswith("/lops"):
-            return None, {"error": "Not in LOPs context. Switch to Solaris tab first."}
-
-        # Create Import USD node
-        import_node = pwd.createNode("importusd", f"import_gen_{generation_id}")
-        import_node.parm("filepath").set(model_path)
-
-        # Create Subnet for organization
-        subnet = pwd.createNode("subnet", f"subnet_gen_{generation_id}")
-        import_node.setInput(0, subnet)
-
-        # Create reference/copy to target prim path
-        copy_node = pwd.createNode("usdcopy", f"copy_gen_{generation_id}")
-        copy_node.setInput(0, import_node)
-
-        # Set up primitive path
-        stage = import_node.stage()
-        if stage:
-            # Find root geometry prim
-            root_prim = None
-            for prim in stage.Traverse():
-                if UsdGeom.Xformable(prim):
-                    root_prim = prim
-                    break
-
-            if root_prim:
-                source_path = root_prim.GetPath()
-                copy_node.parm("primpath").set(str(source_path))
-                copy_node.parm("destpath").set(prim_path)
-
-        # Apply MaterialX if requested
-        if apply_materialx:
-            mat_node = pwd.createNode("materiallibrary", f"matlib_gen_{generation_id}")
-            mat_node.setInput(0, copy_node)
-
-            # Extract textures and create material network
-            metadata = _create_material_network_from_glb(
-                model_path,
-                stage,
-                prim_path,
-                texture_resolution,
+            # Set status
+            lop_node.setColor(hou.Color((0.0, 0.7, 0.0)))
+            hou.ui.setStatusMessage(
+                f"Pixibox USD imported: {scene_id}",
+                severity=hou.severityType.Message
             )
-        else:
-            metadata = {}
 
-        # Display import node
-        copy_node.setDisplayFlag(True)
-        copy_node.setRenderFlag(True)
+        except Exception as e:
+            raise hou.NodeError(f"Solaris cook error: {str(e)}")
 
-        return copy_node.path(), {
-            "model_path": model_path,
-            "prim_path": prim_path,
-            "import_node": import_node.path(),
-            "copy_node": copy_node.path(),
-            **metadata,
-        }
+    def _import_to_solaris(self, lop_node, usd_path: str, mode: str = "sublayer"):
+        """Import USD file into Solaris stage.
 
-    except Exception as e:
-        return None, {"error": f"Import failed: {str(e)}"}
+        Args:
+            lop_node: The LOP node
+            usd_path: Path to USD file
+            mode: 'sublayer' or 'reference'
+        """
+        try:
+            from pxr import Usd, Sdf
 
+            # Get the current stage
+            stage = lop_node.stage()
 
-def create_materialx_network(
-    stage: Any,
-    prim_path: str,
-    textures: Dict[str, str],
-    material_name: str = "PixiboxMaterial",
-) -> bool:
-    """
-    Create MaterialX shader network on USD prim.
+            if stage is None:
+                raise RuntimeError("No USD stage available in LOP node")
 
-    Args:
-        stage: pxr.Usd.Stage object
-        prim_path: Target prim path (e.g. "/World/MyModel")
-        textures: Dict of texture paths {channel: path}
-                  Supported channels: "baseColor", "normal", "roughness",
-                                     "metallic", "displacement"
-        material_name: Name for material prim
+            # Get prim path for import
+            prim_path = lop_node.parm("prim_path").eval()
+            if not prim_path:
+                prim_path = "/pixibox_import"
 
-    Returns:
-        True if successful, False otherwise
+            if mode == "sublayer":
+                # Add as sublayer
+                root_layer = stage.GetRootLayer()
+                root_layer.subLayerPaths.append(usd_path)
+            else:
+                # Add as reference
+                if not stage.GetPrimAtPath(prim_path):
+                    stage.DefinePrim(prim_path, "Xform")
 
-    Example:
-        >>> textures = {
-        ...     "baseColor": "/path/to/color.jpg",
-        ...     "normal": "/path/to/normal.png",
-        ...     "roughness": "/path/to/roughness.png",
-        ... }
-        >>> create_materialx_network(stage, "/World/Vase", textures)
-    """
-    if not HAS_HOUDINI or not Mtlx:
-        return False
+                prim = stage.GetPrimAtPath(prim_path)
+                prim.GetReferences().AddExternalReference(usd_path)
 
-    try:
-        prim = stage.GetPrimAtPath(prim_path)
-        if not prim:
+            hou.ui.setStatusMessage(
+                f"USD {mode}ed to {prim_path}",
+                severity=hou.severityType.Message
+            )
+
+        except Exception as e:
+            raise RuntimeError(f"Solaris import error: {str(e)}")
+
+    @staticmethod
+    def _check_lops_available() -> bool:
+        """Check if LOPs/Solaris is available in this Houdini version.
+
+        Returns:
+            True if LOPs available, False otherwise
+        """
+        try:
+            from pxr import Usd
+            return True
+        except ImportError:
             return False
 
-        # Create material prim
-        material_path = "/World/Materials/" + material_name
-        material = UsdShade.Material.Define(stage, material_path)
 
-        # Create MaterialX shader
-        mtlx_shader = UsdShade.Shader.Define(
-            stage,
-            material_path + "/Shader",
-        )
-
-        # Set shader type (PBR surface)
-        mtlx_shader.SetSourceAsset(
-            Sdf.AssetPath("mtlx/stdlib_defs.mtlx"),
-        )
-
-        # Bind textures to shader inputs
-        for channel, texture_path in textures.items():
-            if channel in ("baseColor", "normal", "roughness", "metallic"):
-                input_name = _channel_to_mtlx_input(channel)
-                mtlx_shader.GetInput(input_name).ConnectToSource(
-                    Sdf.AssetPath(texture_path)
-                )
-
-        # Bind material to geometry
-        binding = UsdShade.MaterialBindingAPI(prim)
-        binding.Bind(material)
-
-        return True
-
-    except Exception as e:
-        print(f"MaterialX creation failed: {e}")
-        return False
-
-
-def _channel_to_mtlx_input(channel: str) -> str:
-    """Map texture channel name to MaterialX input name."""
-    mapping = {
-        "baseColor": "base_color",
-        "normal": "normal",
-        "roughness": "specular_roughness",
-        "metallic": "metalness",
-        "displacement": "displacement",
-    }
-    return mapping.get(channel, channel)
-
-
-def _create_material_network_from_glb(
-    glb_path: str,
-    stage: Any,
-    prim_path: str,
-    texture_resolution: str = "high",
-) -> Dict[str, Any]:
-    """
-    Extract materials and textures from GLB and create USD material network.
+def import_to_solaris(lop_node, usd_path: str, mode: str = "sublayer") -> Tuple[bool, str]:
+    """Import USD file into current Solaris context.
 
     Args:
-        glb_path: Path to GLB file
-        stage: USD stage
-        prim_path: Target prim path
-        texture_resolution: Texture LOD level
+        lop_node: The LOP node to import into
+        usd_path: Path to USD file
+        mode: 'sublayer' or 'reference'
 
     Returns:
-        Metadata dict with material information
+        Tuple of (success, message)
     """
-    metadata: Dict[str, Any] = {
-        "materials_created": False,
-        "texture_count": 0,
-        "error": None,
-    }
-
     try:
-        # Try to extract embedded textures from GLB
-        # This is a simplified version - full implementation would use
-        # pygltf or similar to parse GLB structure
+        node = PixiboxSolarisNode()
+        node._import_to_solaris(lop_node, usd_path, mode)
+        return True, f"Imported to {mode}"
+    except Exception as e:
+        return False, str(e)
 
-        import tempfile
-        temp_dir = tempfile.mkdtemp()
 
-        # Create placeholder texture dict
-        textures = {
-            "baseColor": os.path.join(temp_dir, "BaseColor.png"),
-            "normal": os.path.join(temp_dir, "Normal.png"),
-            "roughness": os.path.join(temp_dir, "Roughness.png"),
+def export_from_solaris(lop_node, output_path: str) -> Tuple[bool, str]:
+    """Export Solaris stage to USD file.
+
+    Args:
+        lop_node: The LOP node to export from
+        output_path: Output USD file path
+
+    Returns:
+        Tuple of (success, message)
+    """
+    try:
+        stage = lop_node.stage()
+        if stage is None:
+            return False, "No USD stage in LOP node"
+
+        # Save stage to USD
+        stage.GetRootLayer().Export(output_path)
+        return True, f"Exported to {output_path}"
+
+    except Exception as e:
+        return False, str(e)
+
+
+def convert_pbr_to_materialsx(
+    lop_node,
+    pbr_material_name: str
+) -> Tuple[bool, str]:
+    """Convert Pixibox PBR material to Houdini MaterialX.
+
+    Args:
+        lop_node: The LOP node
+        pbr_material_name: Name of PBR material to convert
+
+    Returns:
+        Tuple of (success, message)
+    """
+    try:
+        from pxr import Usd, UsdShade
+
+        stage = lop_node.stage()
+        if stage is None:
+            return False, "No USD stage in LOP node"
+
+        # Find material prim
+        material_path = f"/materials/{pbr_material_name}"
+        material_prim = stage.GetPrimAtPath(material_path)
+
+        if not material_prim:
+            return False, f"Material {pbr_material_name} not found"
+
+        # Convert to MaterialX-compatible structure
+        # Create MaterialX material node
+        mx_material_path = f"/materialx/{pbr_material_name}"
+        mx_prim = UsdShade.Material.Define(stage, mx_material_path)
+
+        # Map PBR attributes to MaterialX
+        # This is a simplified conversion - full mapping depends on material complexity
+        pbr_attrs = {
+            "baseColor": ("base_color", "float3"),
+            "metallic": ("metallic", "float"),
+            "roughness": ("roughness", "float"),
+            "normal": ("normal", "normal3"),
         }
 
-        # Create material network
-        if create_materialx_network(stage, prim_path, textures):
-            metadata["materials_created"] = True
-            metadata["texture_count"] = len(textures)
-            metadata["material_path"] = f"/World/Materials/PixiboxMaterial"
+        for pbr_attr, (mx_attr, mx_type) in pbr_attrs.items():
+            pbr_val = material_prim.GetAttribute(pbr_attr)
+            if pbr_val:
+                mx_prim.CreateAttribute(mx_attr, mx_type).Set(pbr_val.Get())
 
-        return metadata
+        return True, f"Converted {pbr_material_name} to MaterialX"
 
     except Exception as e:
-        metadata["error"] = f"Material extraction failed: {str(e)}"
-        return metadata
+        return False, f"MaterialX conversion error: {str(e)}"
 
 
-def optimize_mesh(
-    prim_path: str,
-    target_triangle_count: int = 100000,
-    preserve_uv: bool = True,
-) -> bool:
-    """
-    Apply mesh optimization (decimation, cleanup) to imported geometry.
+def cook_lop(node):
+    """Entry point for LOP cooking.
 
     Args:
-        prim_path: Target prim path
-        target_triangle_count: Target polygon count
-        preserve_uv: Keep UV coordinates during optimization
-
-    Returns:
-        True if successful, False otherwise
+        node: The Houdini LOP node
     """
-    if not HAS_HOUDINI or not hou:
-        return False
-
-    try:
-        # Get current LOP node
-        pwd = hou.pwd()
-        if not pwd or not pwd.path().startswith("/lops"):
-            return False
-
-        # Create geometry cleanup node
-        cleanup = pwd.createNode("geosubset", f"optimize_{prim_path.replace('/', '_')}")
-
-        # Would set up optimization parameters here
-        # This requires deeper integration with Houdini's SOP operations
-
-        return True
-
-    except Exception as e:
-        print(f"Mesh optimization failed: {e}")
-        return False
+    generator = PixiboxSolarisNode()
+    generator.cook(node)

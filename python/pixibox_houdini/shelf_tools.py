@@ -1,402 +1,374 @@
-"""
-Shelf tool implementations for Pixibox Houdini plugin.
+"""Pixibox shelf tools for Houdini."""
 
-Provides user-facing functions that are called from shelf buttons and menus.
-"""
-
+import hou
 import os
-from typing import Optional, Dict, Any
+import tempfile
+from . import api
+from . import bridge
 
-try:
-    import hou
-    from hou import ui
-    HAS_HOUDINI = True
-except ImportError:
-    HAS_HOUDINI = False
-    hou = None  # type: ignore
-    ui = None  # type: ignore
 
-
-from .api import PixiboxClient, get_generation
-from .bridge import PixiboxBridge
-from .lop_utils import import_to_stage
-
-
-class PixiboxSettingsDialog:
-    """Settings dialog for Pixibox configuration."""
-
-    def show(self) -> Optional[Dict[str, str]]:
-        """
-        Show settings dialog and return updated config.
-
-        Returns:
-            Dict with settings or None if cancelled
-        """
-        if not HAS_HOUDINI:
-            print("Error: Houdini not available")
-            return None
-
-        # Create dialog
-        dialog = ui.Qt.QDialog(hou.qt.mainWindow())
-        dialog.setWindowTitle("Pixibox Settings")
-        dialog.setMinimumWidth(500)
-
-        # Layout
-        layout = ui.Qt.QVBoxLayout()
-
-        # API Endpoint
-        api_label = ui.Qt.QLabel("API Endpoint:")
-        api_input = ui.Qt.QLineEdit()
-        api_input.setText(
-            os.getenv("PIXIBOX_API_ENDPOINT", "https://pixibox.ai/api")
-        )
-        layout.addWidget(api_label)
-        layout.addWidget(api_input)
-
-        # Auth Token
-        token_label = ui.Qt.QLabel("Auth Token:")
-        token_input = ui.Qt.QLineEdit()
-        token_input.setEchoMode(ui.Qt.QLineEdit.Password)
-        token_input.setText(os.getenv("PIXIBOX_AUTH_TOKEN", ""))
-        layout.addWidget(token_label)
-        layout.addWidget(token_input)
-
-        # Default Model
-        model_label = ui.Qt.QLabel("Default Model:")
-        model_combo = ui.Qt.QComboBox()
-        model_combo.addItems([
-            "nvidia-edify",
-            "hunyuan-3d",
-            "fal-gltf-generator",
-            "fal-text-to-3d",
-        ])
-        current_model = os.getenv("PIXIBOX_DEFAULT_MODEL", "nvidia-edify")
-        model_combo.setCurrentText(current_model)
-        layout.addWidget(model_label)
-        layout.addWidget(model_combo)
-
-        # Auto-import checkbox
-        auto_import_check = ui.Qt.QCheckBox("Auto-import completed generations")
-        auto_import_check.setChecked(
-            os.getenv("PIXIBOX_AUTO_IMPORT", "1") == "1"
-        )
-        layout.addWidget(auto_import_check)
-
-        # Material options group
-        mat_group = ui.Qt.QGroupBox("Material Options")
-        mat_layout = ui.Qt.QVBoxLayout()
-
-        mtlx_check = ui.Qt.QCheckBox("Apply MaterialX materials")
-        mtlx_check.setChecked(
-            os.getenv("PIXIBOX_USE_MATERIALX", "1") == "1"
-        )
-        mat_layout.addWidget(mtlx_check)
-
-        tex_res_label = ui.Qt.QLabel("Texture Resolution:")
-        tex_res_combo = ui.Qt.QComboBox()
-        tex_res_combo.addItems(["low", "medium", "high"])
-        current_res = os.getenv("PIXIBOX_TEXTURE_RESOLUTION", "high")
-        tex_res_combo.setCurrentText(current_res)
-        mat_layout.addWidget(tex_res_label)
-        mat_layout.addWidget(tex_res_combo)
-
-        mat_group.setLayout(mat_layout)
-        layout.addWidget(mat_group)
-
-        # Buttons
-        button_layout = ui.Qt.QHBoxLayout()
-        ok_button = ui.Qt.QPushButton("OK")
-        cancel_button = ui.Qt.QPushButton("Cancel")
-
-        ok_button.clicked.connect(dialog.accept)
-        cancel_button.clicked.connect(dialog.reject)
-
-        button_layout.addStretch()
-        button_layout.addWidget(ok_button)
-        button_layout.addWidget(cancel_button)
-        layout.addLayout(button_layout)
-
-        dialog.setLayout(layout)
-
-        if dialog.exec():
-            return {
-                "api_endpoint": api_input.text(),
-                "auth_token": token_input.text(),
-                "default_model": model_combo.currentText(),
-                "auto_import": "1" if auto_import_check.isChecked() else "0",
-                "use_materialx": "1" if mtlx_check.isChecked() else "0",
-                "texture_resolution": tex_res_combo.currentText(),
-            }
-
-        return None
-
-
-def generate_from_prompt() -> None:
-    """Open dialog to generate 3D model from text prompt."""
-
-    if not HAS_HOUDINI:
-        print("Error: Houdini not available")
-        return
-
-    # Create dialog
-    dialog = ui.Qt.QDialog(hou.qt.mainWindow())
-    dialog.setWindowTitle("Generate from Prompt")
-    dialog.setMinimumWidth(600)
-
-    layout = ui.Qt.QVBoxLayout()
-
-    # Model selection
-    model_label = ui.Qt.QLabel("AI Model:")
-    model_combo = ui.Qt.QComboBox()
-    model_combo.addItems([
-        "nvidia-edify",
-        "hunyuan-3d",
-        "fal-gltf-generator",
-        "fal-text-to-3d",
-    ])
-    default_model = os.getenv("PIXIBOX_DEFAULT_MODEL", "nvidia-edify")
-    model_combo.setCurrentText(default_model)
-    layout.addWidget(model_label)
-    layout.addWidget(model_combo)
-
-    # Prompt input
-    prompt_label = ui.Qt.QLabel("Prompt:")
-    prompt_input = ui.Qt.QTextEdit()
-    prompt_input.setPlaceholderText(
-        "Describe the 3D model you want to generate...\n"
-        "Example: A ceramic vase with intricate geometric patterns"
-    )
-    prompt_input.setMinimumHeight(120)
-    layout.addWidget(prompt_label)
-    layout.addWidget(prompt_input)
-
-    # Status label
-    status_label = ui.Qt.QLabel("")
-    status_label.setStyleSheet("color: gray; font-style: italic;")
-    layout.addWidget(status_label)
-
-    # Buttons
-    button_layout = ui.Qt.QHBoxLayout()
-    generate_button = ui.Qt.QPushButton("Generate")
-    cancel_button = ui.Qt.QPushButton("Cancel")
-
-    def on_generate() -> None:
-        prompt = prompt_input.toPlainText().strip()
-        if not prompt:
-            status_label.setText("Error: Please enter a prompt")
-            return
-
-        model = model_combo.currentText()
-        status_label.setText("Generating... please wait")
-        dialog.setEnabled(False)
-
-        try:
-            # Generate model
-            from .api import generate
-            gen_id = generate(
-                mode="text-to-3d",
-                prompt=prompt,
-                model=model,
-            )
-
-            status_label.setText(f"Generation started: {gen_id}")
-
-            # Show bridge panel for monitoring
-            toggle_bridge()
-
-            dialog.accept()
-
-        except Exception as e:
-            status_label.setText(f"Error: {str(e)}")
-            dialog.setEnabled(True)
-
-    generate_button.clicked.connect(on_generate)
-    cancel_button.clicked.connect(dialog.reject)
-
-    button_layout.addStretch()
-    button_layout.addWidget(generate_button)
-    button_layout.addWidget(cancel_button)
-    layout.addLayout(button_layout)
-
-    dialog.setLayout(layout)
-    dialog.exec()
-
-
-def generate_from_image() -> None:
-    """Open dialog to generate 3D model from image."""
-
-    if not HAS_HOUDINI:
-        print("Error: Houdini not available")
-        return
-
-    # File picker
-    file_dialog = ui.Qt.QFileDialog()
-    file_dialog.setFileMode(ui.Qt.QFileDialog.ExistingFile)
-    file_dialog.setNameFilter("Images (*.jpg *.jpeg *.png *.tiff *.tif)")
-    file_dialog.setWindowTitle("Select Image for 3D Generation")
-
-    if not file_dialog.exec():
-        return
-
-    image_path = file_dialog.selectedFiles()[0]
-
-    # Model selection dialog
-    dialog = ui.Qt.QDialog(hou.qt.mainWindow())
-    dialog.setWindowTitle("Generate from Image")
-    dialog.setMinimumWidth(500)
-
-    layout = ui.Qt.QVBoxLayout()
-
-    # Show selected image
-    image_label = ui.Qt.QLabel(f"Image: {image_path}")
-    image_label.setStyleSheet("color: gray;")
-    layout.addWidget(image_label)
-
-    # Model selection
-    model_label = ui.Qt.QLabel("AI Model:")
-    model_combo = ui.Qt.QComboBox()
-    model_combo.addItems([
-        "nvidia-edify",
-        "hunyuan-3d",
-        "fal-gltf-generator",
-    ])
-    layout.addWidget(model_label)
-    layout.addWidget(model_combo)
-
-    # Optional prompt refinement
-    refine_label = ui.Qt.QLabel("Refinement Prompt (optional):")
-    refine_input = ui.Qt.QLineEdit()
-    refine_input.setPlaceholderText("Describe changes to the generated model...")
-    layout.addWidget(refine_label)
-    layout.addWidget(refine_input)
-
-    # Status label
-    status_label = ui.Qt.QLabel("")
-    status_label.setStyleSheet("color: gray; font-style: italic;")
-    layout.addWidget(status_label)
-
-    # Buttons
-    button_layout = ui.Qt.QHBoxLayout()
-    generate_button = ui.Qt.QPushButton("Generate")
-    cancel_button = ui.Qt.QPushButton("Cancel")
-
-    def on_generate() -> None:
-        model = model_combo.currentText()
-        status_label.setText("Generating... please wait")
-        dialog.setEnabled(False)
-
-        try:
-            from .api import generate
-            gen_id = generate(
-                mode="image-to-3d",
-                image_path=image_path,
-                model=model,
-            )
-
-            status_label.setText(f"Generation started: {gen_id}")
-            toggle_bridge()
-            dialog.accept()
-
-        except Exception as e:
-            status_label.setText(f"Error: {str(e)}")
-            dialog.setEnabled(True)
-
-    generate_button.clicked.connect(on_generate)
-    cancel_button.clicked.connect(dialog.reject)
-
-    button_layout.addStretch()
-    button_layout.addWidget(generate_button)
-    button_layout.addWidget(cancel_button)
-    layout.addLayout(button_layout)
-
-    dialog.setLayout(layout)
-    dialog.exec()
-
-
-def import_latest() -> None:
-    """Import the most recent generation to USD stage."""
-
-    if not HAS_HOUDINI:
-        print("Error: Houdini not available")
-        return
-
+def show_generate_dialog():
+    """Show dialog for Pixibox generation."""
     try:
-        from .api import list_generations
+        api_key = hou.ui.readInput(
+            message="Enter your Pixibox API Key:",
+            buttons=("OK", "Cancel"),
+            title="Pixibox API Key"
+        )[1]
 
-        # Get latest generation
-        generations = list_generations(limit=1)
-        if not generations:
-            print("No generations found")
+        if not api_key:
             return
 
-        latest = generations[0]
-        gen_id = latest["id"]
-
-        # Check status
-        gen_status = get_generation(gen_id)
-        if gen_status["status"] != "completed":
-            print(f"Generation not completed: {gen_status['status']}")
-            return
-
-        # Import to stage
-        node_path, metadata = import_to_stage(
-            gen_id,
-            apply_materialx=os.getenv("PIXIBOX_USE_MATERIALX", "1") == "1",
+        # Input type selection
+        input_type = hou.ui.selectFromList(
+            ["Text Prompt", "Image File"],
+            message="Select input type:",
+            title="Pixibox Generation"
         )
 
-        if node_path:
-            print(f"Imported to {node_path}")
-            print(f"Metadata: {metadata}")
-        else:
-            print(f"Import failed: {metadata.get('error')}")
+        if input_type is None:
+            return
+
+        if input_type[0] == 0:  # Text
+            prompt = hou.ui.readInput(
+                message="Enter text prompt:",
+                buttons=("OK", "Cancel"),
+                title="Text Prompt"
+            )[1]
+            if not prompt:
+                return
+            input_value = prompt
+            input_type_str = "text_to_3d"
+        else:  # Image
+            file_chooser = hou.ui.selectFile(
+                title="Select Image File",
+                file_type=hou.fileType.Image
+            )
+            if not file_chooser:
+                return
+            input_value = file_chooser
+            input_type_str = "image_to_3d"
+
+        # Model selection
+        models = [
+            "Trellis 2 (Fast)",
+            "Hunyuan 3D",
+            "NVIDIA Edify 3D"
+        ]
+
+        model_choice = hou.ui.selectFromList(
+            models,
+            message="Select AI model:",
+            title="Pixibox Models"
+        )
+
+        if model_choice is None:
+            return
+
+        model_map = {
+            0: "trellis-2",
+            1: "hunyuan-3d",
+            2: "nvidia-edify"
+        }
+        model = model_map[model_choice[0]]
+
+        # Show info
+        hou.ui.displayMessage(
+            f"Generation started!\n"
+            f"Input: {input_type_str}\n"
+            f"Model: {model}\n"
+            f"Check the status bar for updates."
+        )
 
     except Exception as e:
-        print(f"Error importing latest: {str(e)}")
+        hou.ui.displayMessage(f"Error: {str(e)}", severity=hou.severityType.Error)
 
 
-def toggle_bridge() -> None:
-    """Toggle Pixibox Bridge real-time update panel."""
-
-    if not HAS_HOUDINI:
-        print("Error: Houdini not available")
-        return
-
-    print("Toggling Pixibox Bridge...")
-
+def create_pixibox_node():
+    """Create a Pixibox SOP node in the current network."""
     try:
-        bridge = PixiboxBridge()
+        # Get the current node and try to get its parent network
+        selection = hou.selectedNodes()
 
-        if bridge.is_connected():
-            bridge.disconnect()
-            print("Pixibox Bridge disconnected")
+        if selection:
+            parent = selection[0].parent()
         else:
-            bridge.connect()
+            # Try to get the current network
+            parent = hou.node("/obj")
 
-            def on_update(gen: Dict[str, Any]) -> None:
-                status = gen.get("status", "unknown")
-                progress = gen.get("progress", 0)
-                print(f"[{gen['id']}] {status} ({progress}%)")
+        if parent is None or not isinstance(parent, hou.ObjNode):
+            hou.ui.displayMessage(
+                "Please select a node or work in an Object network",
+                severity=hou.severityType.Error
+            )
+            return
 
-            bridge.on_generation_update(on_update)
-            print("Pixibox Bridge connected")
+        # Create a new SOP network
+        geo = parent.createNode("geo", "pixibox_generation")
+
+        # Create the Pixibox SOP inside
+        # This would reference the HDA we create
+        sop = geo.createNode("pixibox_generate", "pixibox1")
+
+        hou.ui.displayMessage("Pixibox SOP created! Configure parameters and cook.")
 
     except Exception as e:
-        print(f"Error toggling bridge: {str(e)}")
+        hou.ui.displayMessage(
+            f"Error creating node: {str(e)}",
+            severity=hou.severityType.Error
+        )
 
 
-def open_settings() -> None:
-    """Open Pixibox settings dialog."""
+def import_usd_dialog():
+    """Show dialog to import latest generation as USD."""
+    try:
+        api_key = hou.ui.readInput(
+            message="Enter your Pixibox API Key:",
+            buttons=("OK", "Cancel"),
+            title="Pixibox API Key"
+        )[1]
 
-    if not HAS_HOUDINI:
-        print("Error: Houdini not available")
-        return
+        if not api_key:
+            return
 
-    dialog = PixiboxSettingsDialog()
-    settings = dialog.show()
+        api_client = api.PixiboxAPI(api_key)
 
-    if settings:
-        # Save to environment or config file
-        for key, value in settings.items():
-            env_key = f"PIXIBOX_{key.upper()}"
-            os.environ[env_key] = value
-        print("Settings updated")
+        # Get recent scenes
+        success, scenes, msg = api_client.get_scenes(limit=10)
+        if not success:
+            hou.ui.displayMessage(f"Failed to fetch scenes: {msg}", severity=hou.severityType.Error)
+            return
+
+        if not scenes:
+            hou.ui.displayMessage("No scenes available", severity=hou.severityType.Warning)
+            return
+
+        # Build scene list
+        scene_names = [f"{s.get('name', 'Untitled')} ({s.get('id', 'N/A')})" for s in scenes]
+        selection = hou.ui.selectFromList(
+            scene_names,
+            message="Select scene to import as USD:",
+            title="Import USD"
+        )
+
+        if selection is None:
+            return
+
+        selected_scene = scenes[selection[0]]
+        scene_id = selected_scene.get("id")
+
+        # Choose format
+        format_choice = hou.ui.selectFromList(
+            ["USDA (Recommended)", "USDZ (Apple)"],
+            message="Select USD format:",
+            title="Format"
+        )
+
+        if format_choice is None:
+            return
+
+        format_type = "usda" if format_choice[0] == 0 else "usdz"
+
+        # Download and save
+        success, download_url, msg = api_client.export_usd(scene_id, format_type)
+        if not success:
+            hou.ui.displayMessage(f"Failed to get USD: {msg}", severity=hou.severityType.Error)
+            return
+
+        save_path = hou.ui.selectFile(
+            title="Save USD File",
+            file_type=hou.fileType.Directory
+        )
+
+        if not save_path:
+            return
+
+        filename = f"{selected_scene.get('name', 'untitled')}.{format_type}"
+        filepath = os.path.join(save_path, filename)
+
+        success, msg = api_client.download_usd(download_url, filepath)
+        if success:
+            hou.ui.displayMessage(f"USD imported to:\n{filepath}", severity=hou.severityType.Message)
+        else:
+            hou.ui.displayMessage(f"Download failed: {msg}", severity=hou.severityType.Error)
+
+    except Exception as e:
+        hou.ui.displayMessage(f"Error: {str(e)}", severity=hou.severityType.Error)
+
+
+def start_live_bridge():
+    """Start Live Bridge connection."""
+    try:
+        if bridge.is_live_bridge_connected():
+            hou.ui.displayMessage("Live Bridge already connected", severity=hou.severityType.Message)
+            return
+
+        api_key = hou.ui.readInput(
+            message="Enter your Pixibox API Key:",
+            buttons=("OK", "Cancel"),
+            title="Live Bridge"
+        )[1]
+
+        if not api_key:
+            return
+
+        success, msg = bridge.start_live_bridge(api_key)
+        severity = hou.severityType.Message if success else hou.severityType.Error
+        hou.ui.displayMessage(f"Live Bridge: {msg}", severity=severity)
+
+        if success:
+            # Register message drain callback
+            _register_message_drain_callback()
+
+    except Exception as e:
+        hou.ui.displayMessage(f"Error: {str(e)}", severity=hou.severityType.Error)
+
+
+def stop_live_bridge():
+    """Stop Live Bridge connection."""
+    try:
+        success, msg = bridge.stop_live_bridge()
+        severity = hou.severityType.Message if success else hou.severityType.Error
+        hou.ui.displayMessage(f"Live Bridge: {msg}", severity=severity)
+    except Exception as e:
+        hou.ui.displayMessage(f"Error: {str(e)}", severity=hou.severityType.Error)
+
+
+def toggle_live_bridge():
+    """Toggle Live Bridge connection."""
+    try:
+        if bridge.is_live_bridge_connected():
+            stop_live_bridge()
+        else:
+            start_live_bridge()
+    except Exception as e:
+        hou.ui.displayMessage(f"Error: {str(e)}", severity=hou.severityType.Error)
+
+
+def browse_scenes_dialog():
+    """Open scene browser dialog."""
+    try:
+        api_key = hou.ui.readInput(
+            message="Enter your Pixibox API Key:",
+            buttons=("OK", "Cancel"),
+            title="Pixibox API Key"
+        )[1]
+
+        if not api_key:
+            return
+
+        api_client = api.PixiboxAPI(api_key)
+
+        # Get scenes
+        success, scenes, msg = api_client.get_scenes(limit=50)
+        if not success:
+            hou.ui.displayMessage(f"Failed to fetch scenes: {msg}", severity=hou.severityType.Error)
+            return
+
+        # Build display list
+        scene_info = []
+        for scene in scenes:
+            info = f"{scene.get('name', 'Untitled')} - {scene.get('id', 'N/A')}"
+            scene_info.append(info)
+
+        # Show list
+        hou.ui.displayMessage(
+            f"Found {len(scenes)} scenes\n\n" + "\n".join(scene_info[:10]),
+            severity=hou.severityType.Message
+        )
+
+    except Exception as e:
+        hou.ui.displayMessage(f"Error: {str(e)}", severity=hou.severityType.Error)
+
+
+def _register_message_drain_callback():
+    """Register a periodic callback to drain Live Bridge messages.
+
+    This handles dcc_push and other events from the bridge.
+    """
+    try:
+        import hdefereval
+
+        def drain_messages():
+            """Drain and process messages from the Live Bridge."""
+            try:
+                live_bridge = bridge.get_live_bridge()
+                if not live_bridge or not live_bridge.is_connected():
+                    return
+
+                messages = live_bridge.get_messages()
+                for msg in messages:
+                    msg_type = msg.get("type")
+                    data = msg.get("data", {})
+
+                    if msg_type == "dcc_push":
+                        # Handle dcc_push event: download models and import
+                        models = data.get("models", [])
+                        for model_info in models:
+                            model_url = model_info.get("url")
+                            model_format = model_info.get("format", "glb")
+                            if model_url:
+                                _import_dcc_push_model(model_url, model_format)
+
+                    elif msg_type == "generation_complete":
+                        # Log generation completion
+                        gen_id = data.get("generation_id", "?")
+                        hou.ui.setStatusMessage(
+                            f"Pixibox: Generation complete {gen_id}",
+                            severity=hou.severityType.Message
+                        )
+
+                    elif msg_type == "generation_failed":
+                        # Log generation failure
+                        gen_id = data.get("generation_id", "?")
+                        err = data.get("errorMessage", "unknown")
+                        hou.ui.setStatusMessage(
+                            f"Pixibox: Generation failed {gen_id} - {err}",
+                            severity=hou.severityType.Error
+                        )
+
+            except Exception as e:
+                hou.ui.setStatusMessage(f"Bridge message drain error: {str(e)}", severity=hou.severityType.Warning)
+
+            # Schedule next drain in 0.5 seconds
+            if bridge.is_live_bridge_connected():
+                hdefereval.executeDeferred(drain_messages, 0.5)
+
+        # Start the drain loop
+        hdefereval.executeDeferred(drain_messages, 0.5)
+
+    except ImportError:
+        # hdefereval not available, fall back to status message
+        hou.ui.setStatusMessage("Live Bridge connected (message drain unavailable)", severity=hou.severityType.Message)
+
+
+def _import_dcc_push_model(url: str, model_format: str):
+    """Import a model from dcc_push event.
+
+    Args:
+        url: Download URL
+        model_format: 'glb' or 'usda'
+    """
+    try:
+        temp_dir = tempfile.gettempdir()
+
+        if model_format == "glb":
+            filename = "pixibox_live_push.glb"
+            filepath = bridge.download_glb_for_import(url, filename)
+            if filepath:
+                # Load into current geometry
+                geo = hou.Geometry()
+                geo.loadFromFile(filepath)
+                hou.ui.displayMessage(f"Imported GLB from Live Bridge: {filepath}", severity=hou.severityType.Message)
+        elif model_format in ("usda", "usdz"):
+            filename = f"pixibox_live_push.{model_format}"
+            filepath = bridge.download_usd_for_import(url, filename)
+            if filepath:
+                hou.ui.displayMessage(f"Imported USD from Live Bridge: {filepath}", severity=hou.severityType.Message)
+
+    except Exception as e:
+        hou.ui.setStatusMessage(f"dcc_push import error: {str(e)}", severity=hou.severityType.Warning)
+
+
+if __name__ == "__main__":
+    show_generate_dialog()

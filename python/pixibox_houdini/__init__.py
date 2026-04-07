@@ -1,51 +1,45 @@
-"""
-Pixibox Houdini Plugin — 3D AI Generation for Solaris/LOPs
+"""Pixibox AI plugin for Houdini.
 
-This module provides a complete Python API for integrating Pixibox.ai
-(3D AI tool comparison platform) with Houdini's Solaris (USD) environment.
-
-Main functions:
-    - generate(): Create 3D models from text or image prompts
-    - import_to_stage(): Add generated models to USD stage with materials
-    - get_generation(): Retrieve generation status and metadata
-    - list_generations(): Browse past generations
-    - download_model(): Fetch models in various formats
-
-Classes:
-    - PixiboxBridge: Real-time WebSocket sync with live progress updates
-    - PixiboxClient: REST API client for Pixibox backend
-
-Example:
-    >>> from pixibox_houdini import generate, import_to_stage
-    >>> gen_id = generate("text-to-3d", "A ceramic vase", "nvidia-edify")
-    >>> import_to_stage(gen_id, "/World/Imports/Vase", apply_materialx=True)
+This module provides integration with Houdini for AI-powered 3D generation,
+USD/Solaris support, and Live Bridge real-time sync.
 """
 
-from .api import (
-    PixiboxClient,
-    generate,
-    get_generation,
-    list_generations,
-    download_model,
-)
-from .bridge import PixiboxBridge
-from .lop_utils import (
-    get_current_stage,
-    import_to_stage,
-    create_materialx_network,
-)
-
-__version__ = "1.0.0"
+__version__ = "2.1.0"
 __author__ = "Pixibox.ai"
+__license__ = "Commercial"
+
+try:
+    import hou
+    HOUDINI_AVAILABLE = True
+except ImportError:
+    HOUDINI_AVAILABLE = False
+
+# Import submodules
+if HOUDINI_AVAILABLE:
+    try:
+        from . import api
+        from . import hda_node
+        from . import shelf_tools
+        from . import menu
+        from . import lop_utils
+        from . import bridge
+    except ImportError as e:
+        print(f"Warning: Could not import Pixibox modules: {e}")
+
+    # Cleanup on unload
+    def _cleanup():
+        """Clean up resources on plugin unload."""
+        try:
+            from . import bridge
+            bridge.stop_live_bridge()
+        except Exception:
+            pass
 
 __all__ = [
-    "PixiboxClient",
-    "PixiboxBridge",
-    "generate",
-    "get_generation",
-    "list_generations",
-    "download_model",
-    "get_current_stage",
-    "import_to_stage",
-    "create_materialx_network",
+    "api",
+    "hda_node",
+    "shelf_tools",
+    "menu",
+    "lop_utils",
+    "bridge",
 ]
